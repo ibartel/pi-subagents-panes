@@ -16,7 +16,12 @@ import {
   extractOrcaHandle,
   extractOrcaScreen,
 } from "../pi-extension/subagents/surfaces/orca.ts";
-import { parseDefaultsConfig, parseDisplayConfig } from "../pi-extension/subagents/status.ts";
+import {
+  parseArchitectConfig,
+  parseDefaultsConfig,
+  parseDisplayConfig,
+  parseModelsConfig,
+} from "../pi-extension/subagents/status.ts";
 import { DEFAULT_DISPLAY_CONFIG } from "../pi-extension/subagents/status.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -38,6 +43,68 @@ describe("defaults config", () => {
     assert.throws(() => parseDefaultsConfig({ defaults: { thinking: "turbo" } }), /defaults\.thinking/);
     assert.throws(() => parseDefaultsConfig({ defaults: { model: "" } }), /defaults\.model/);
     assert.throws(() => parseDefaultsConfig({ defaults: { modle: "typo" } }), /defaults/);
+  });
+});
+
+describe("models config", () => {
+  it("is empty when the block is absent", () => {
+    assert.deepEqual(parseModelsConfig({}), { annotations: {}, exclude: [], tiers: {} });
+  });
+
+  it("reads annotations, excludes and tiers", () => {
+    const parsed = parseModelsConfig({
+      models: {
+        exclude: ["*experimental*"],
+        tiers: { cheap: ["deepseek/*"] },
+        annotations: { "a/model": "strong at refactors" },
+      },
+    });
+    assert.deepEqual(parsed.exclude, ["*experimental*"]);
+    assert.deepEqual(parsed.tiers, { cheap: ["deepseek/*"] });
+    assert.deepEqual(parsed.annotations, { "a/model": "strong at refactors" });
+  });
+
+  it("rejects unknown keys and bad shapes", () => {
+    assert.throws(() => parseModelsConfig({ models: { tier: {} } }), /unsupported key/);
+    assert.throws(() => parseModelsConfig({ models: { exclude: "nope" } }), /models\.exclude/);
+    assert.throws(() => parseModelsConfig({ models: { annotations: { a: 1 } } }), /annotations/);
+  });
+
+  it("accepts a thinking level on tier entries and rejects a bogus one", () => {
+    assert.deepEqual(
+      parseModelsConfig({ models: { tiers: { allround: ["p/id:xhigh"] } } }).tiers,
+      { allround: ["p/id:xhigh"] },
+    );
+    assert.throws(
+      () => parseModelsConfig({ models: { tiers: { deep: ["p/id:turbo"] } } }),
+      /invalid thinking level/,
+    );
+  });
+});
+
+describe("architect config", () => {
+  it("defaults to confirm-first with caps", () => {
+    assert.deepEqual(parseArchitectConfig({}), { mode: "confirm", maxAgents: 4, maxDepth: 2 });
+  });
+
+  it("accepts every autonomy mode", () => {
+    for (const mode of ["plan", "confirm", "auto"]) {
+      assert.equal(parseArchitectConfig({ architect: { mode } }).mode, mode);
+    }
+  });
+
+  it("rejects an unknown mode and non-integer caps", () => {
+    assert.throws(() => parseArchitectConfig({ architect: { mode: "yolo" } }), /architect\.mode/);
+    assert.throws(() => parseArchitectConfig({ architect: { maxAgents: -1 } }), /maxAgents/);
+    assert.throws(() => parseArchitectConfig({ architect: { maxDepth: 1.5 } }), /maxDepth/);
+  });
+
+  it("treats 0 as disabled caps", () => {
+    assert.deepEqual(parseArchitectConfig({ architect: { maxAgents: 0, maxDepth: 0 } }), {
+      mode: "confirm",
+      maxAgents: 0,
+      maxDepth: 0,
+    });
   });
 });
 

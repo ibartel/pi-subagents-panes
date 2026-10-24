@@ -7,5 +7,15 @@
     "nestedMode": "splitDown",
     "multiplexer": "auto"
   },
-  "defaults": {}
+  "defaults": {},
+  "models": {
+    "exclude": [],
+    "tiers": {},
+    "annotations": {}
+  },
+  "architect": {
+    "mode": "confirm",
+    "maxAgents": 4,
+    "maxDepth": 2
+  }
 }

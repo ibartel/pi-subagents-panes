@@ -1,11 +1,13 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync, readdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync, readdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+
+const testApi = (subagentsModule as any).__test__;
 
 import {
   getLeafId,
@@ -30,7 +32,12 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/surfaces/index.ts";
+import {
+  shellEscape,
+  renderScript,
+  renderScriptHeader,
+  writeScriptFile,
+} from "../pi-extension/subagents/surfaces/index.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -1463,6 +1470,141 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("ranks model rows by cost and honours filters, excludes and tiers", () => {
+    const mod = subagentsModule as any;
+    const rows = [
+      { selector: "a/flash", provider: "a", id: "flash", inputCost: 0.1, outputCost: 0.2, contextWindow: 128_000, maxTokens: 8_000, thinkingLevels: [], available: true, tiers: ["cheap"], costKnown: true },
+      { selector: "a/sonnet", provider: "a", id: "sonnet", inputCost: 3, outputCost: 15, contextWindow: 200_000, maxTokens: 16_000, thinkingLevels: ["low", "high"], available: true, tiers: ["deep"], costKnown: true },
+      { selector: "b/noauth", provider: "b", id: "noauth", inputCost: 0.05, outputCost: 0.05, contextWindow: 64_000, maxTokens: 4_000, thinkingLevels: [], available: false, tiers: [], costKnown: true },
+      { selector: "c/unpriced", provider: "c", id: "unpriced", inputCost: 0, outputCost: 0, contextWindow: 300_000, maxTokens: 8_000, thinkingLevels: [], available: true, tiers: [], costKnown: false },
+    ];
+
+    // Priced models cheapest-first, then unpriced ones; unavailable hidden.
+    const all = mod.selectModelRows(rows, {}, { exclude: [] });
+    assert.deepEqual(all.map((r: any) => r.selector), ["a/flash", "a/sonnet", "c/unpriced"]);
+
+    // Filters compose.
+    assert.deepEqual(
+      mod.selectModelRows(rows, { needsReasoning: true, minContext: 150_000 }, { exclude: [] }).map((r: any) => r.selector),
+      ["a/sonnet"],
+    );
+    // A budget cannot be satisfied by a model whose price is unknown.
+    assert.deepEqual(mod.selectModelRows(rows, { maxInputCost: 1 }, { exclude: [] }).map((r: any) => r.selector), ["a/flash"]);
+    assert.deepEqual(mod.selectModelRows(rows, { tier: "deep" }, { exclude: [] }).map((r: any) => r.selector), ["a/sonnet"]);
+
+    // Exclude patterns can be provider-globbed.
+    assert.deepEqual(mod.selectModelRows(rows, {}, { exclude: ["a/*"] }).length, 1);
+
+    // Availability can be opted into.
+    assert.equal(mod.selectModelRows(rows, { includeUnavailable: true }, { exclude: [] }).length, 4);
+  });
+
+  it("derives thinking levels from the model map, falling back to reasoning support", () => {
+    const mod = subagentsModule as any;
+    assert.deepEqual(mod.thinkingLevelsFor({ thinkingLevelMap: { low: 1, high: 2, max: null } }), ["low", "high"]);
+    assert.ok(mod.thinkingLevelsFor({ reasoning: true }).includes("high"));
+    assert.deepEqual(mod.thinkingLevelsFor({ reasoning: false }), []);
+  });
+
+  it("matches model selectors exactly and by glob", () => {
+    const mod = subagentsModule as any;
+    assert.ok(mod.matchesModelSelector("p/id", "id", "p/id"));
+    assert.ok(mod.matchesModelSelector("p/id", "id", "id"));
+    assert.ok(mod.matchesModelSelector("p/id", "id", "*id*"));
+    assert.ok(mod.matchesModelSelector("p/model-x", "model-x", "p/*"));
+    assert.ok(!mod.matchesModelSelector("p/id", "id", "other/*"));
+  });
+
+  it("enforces the spawn budget and depth caps", () => {
+    const mod = subagentsModule as any;
+    const limits = { maxAgents: 2, maxDepth: 2 };
+    assert.equal(mod.checkSpawnLimits({ depth: 1, spawnedThisRun: 0 }, limits), null);
+    assert.match(mod.checkSpawnLimits({ depth: 3, spawnedThisRun: 0 }, limits), /depth limit/);
+    assert.match(mod.checkSpawnLimits({ depth: 1, spawnedThisRun: 2 }, limits), /budget exhausted/);
+    // 0 disables a cap.
+    assert.equal(mod.checkSpawnLimits({ depth: 9, spawnedThisRun: 99 }, { maxAgents: 0, maxDepth: 0 }), null);
+  });
+
+  it("states the configured autonomy mode to the architect", () => {
+    const mod = subagentsModule as any;
+    assert.match(mod.formatArchitectDirective({ mode: "plan", maxAgents: 4, maxDepth: 2 }), /plan-only/);
+    assert.match(mod.formatArchitectDirective({ mode: "confirm", maxAgents: 4, maxDepth: 2 }), /confirm-first/);
+    assert.match(mod.formatArchitectDirective({ mode: "auto", maxAgents: 4, maxDepth: 2 }), /execute/);
+    assert.match(mod.formatArchitectDirective({ mode: "auto", maxAgents: 4, maxDepth: 2 }), /at most 4 subagents/);
+  });
+
+  it("builds catalog rows from a registry with config annotations and tiers", () => {
+    const mod = subagentsModule as any;
+    const registry = {
+      getAll: () => [
+        { provider: "p", id: "model-a", cost: { input: 1, output: 2 }, contextWindow: 100_000, maxTokens: 4_000, reasoning: true },
+        { provider: "p", id: "model-b", cost: { input: 0.5, output: 1 }, contextWindow: 50_000, maxTokens: 2_000, reasoning: false },
+      ],
+      hasConfiguredAuth: (model: any) => model.id === "model-a",
+    };
+    const config = { exclude: [], tiers: { cheap: ["p/model-b"] }, annotations: { "p/model-a": "strong" } };
+
+    const rows = mod.buildModelRows(registry, config);
+    assert.deepEqual(rows.map((r: any) => r.selector), ["p/model-a", "p/model-b"]);
+    assert.equal(rows[0].available, true);
+    assert.equal(rows[0].note, "strong");
+    assert.deepEqual(rows[1].tiers, ["cheap"]);
+    assert.equal(rows[1].available, false);
+  });
+
+  it("splits a thinking suffix off a model selector only when it is a real level", () => {
+    const mod = subagentsModule as any;
+    assert.deepEqual(mod.splitThinkingSuffix("p/id:xhigh"), { selector: "p/id", thinking: "xhigh" });
+    assert.deepEqual(mod.splitThinkingSuffix("p/id"), { selector: "p/id" });
+    // Not a thinking level -> treated as part of the id, not stripped.
+    assert.deepEqual(mod.splitThinkingSuffix("p/id:bogus"), { selector: "p/id:bogus" });
+  });
+
+  it("uses the model selector's thinking suffix for the child", () => {
+    const mod = subagentsModule as any;
+    // Tier entry `model:xhigh` becomes model + thinking, and the suffix wins over
+    // the agent's own thinking setting.
+    assert.deepEqual(
+      mod.resolveExecutionTarget({ requestedModel: "p/id:max", agentThinking: "low" }),
+      { model: "p/id", thinking: "max" },
+    );
+    // A plain selector keeps the usual precedence.
+    assert.deepEqual(
+      mod.resolveExecutionTarget({ requestedModel: "p/id", agentThinking: "low" }),
+      { model: "p/id", thinking: "low" },
+    );
+  });
+
+  it("records the thinking level each tier pins and shows it in the table", () => {
+    const mod = subagentsModule as any;
+    const registry = {
+      getAll: () => [
+        { provider: "p", id: "model-a", cost: { input: 1, output: 2 }, contextWindow: 100_000, maxTokens: 4_000, reasoning: true },
+        { provider: "p", id: "model-b", cost: { input: 0.5, output: 1 }, contextWindow: 100_000, maxTokens: 4_000, reasoning: true },
+      ],
+      hasConfiguredAuth: () => true,
+    };
+    // model-b sits in two tiers that pin different levels: each tier keeps its own.
+    const rows = mod.buildModelRows(registry, {
+      exclude: [],
+      tiers: { allround: ["p/model-a:xhigh"], cheap: ["p/model-b:high"], deep: ["p/model-b:max"] },
+      annotations: {},
+    });
+
+    const a = rows.find((r: any) => r.id === "model-a");
+    assert.deepEqual(a.tiers, ["allround"]);
+    assert.deepEqual(a.tierThinking, { allround: "xhigh" });
+
+    const b = rows.find((r: any) => r.id === "model-b");
+    assert.deepEqual(b.tiers, ["cheap", "deep"]);
+    assert.deepEqual(b.tierThinking, { cheap: "high", deep: "max" });
+
+    const table = mod.formatModelTable(rows);
+    assert.match(table, /allround:xhigh/);
+    assert.match(table, /cheap:high/);
+    assert.match(table, /deep:max/);
+  });
+
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
@@ -2815,6 +2957,163 @@ describe("tmux.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+
+    it("neutralises every hostile shell metacharacter without executing it", () => {
+      // Rendered strings only: nothing here is passed to a shell.
+      const hostiles = [
+        "x'; touch /tmp/pwned; echo '",
+        "$(id)",
+        "`id`",
+        'quote " and $HOME and \\ backslash',
+        "line one\nline two",
+        "trailing backslash \\",
+        "starts with --offline",
+      ];
+      for (const hostile of hostiles) {
+        const escaped = shellEscape(hostile);
+        assert.ok(escaped.startsWith("'") && escaped.endsWith("'"), hostile);
+        // The only unquoted character sequence is the quote-escape idiom itself.
+        const shrunk = escaped.slice(1, -1).replace(/'\\''/g, "");
+        assert.ok(!shrunk.includes("'"), `unescaped quote in ${escaped}`);
+      }
+    });
+  });
+
+  describe("renderScriptHeader", () => {
+    it("forces every line of an embedded value to be a comment", () => {
+      // `name` reaches the header unvalidated and can contain newlines.
+      const name = "innocent\ntouch /tmp/pwned\necho done";
+      const rendered = renderScriptHeader(`# Subagent launch script for ${name}`);
+      const lines = rendered.split("\n");
+      assert.equal(lines.length, 3);
+      for (const line of lines) {
+        assert.ok(line.startsWith("#"), `escaped header line is not a comment: ${line}`);
+      }
+      assert.ok(!lines.includes("touch /tmp/pwned"));
+    });
+
+    it("handles CRLF, bare CR, and empty lines", () => {
+      assert.equal(renderScriptHeader("a\r\nb\rc"), "# a\n# b\n# c");
+      assert.equal(renderScriptHeader("a\n\nb"), "# a\n#\n# b");
+    });
+  });
+
+  describe("renderScript", () => {
+    it("keeps a hostile header out of the executable part", () => {
+      const command = "echo hello";
+      const script = renderScript(
+        command,
+        [
+          "# Claude Code subagent launch script for evil\ntouch /tmp/pwned",
+          "# Generated: now",
+        ].join("\n"),
+      );
+      const lines = script.split("\n");
+      assert.equal(lines[0], "#!/bin/bash");
+      // Every header line is a comment; only the command line is executable.
+      const executable = lines.filter((line) => line !== "" && !line.startsWith("#"));
+      assert.deepEqual(executable, [command]);
+      assert.ok(script.endsWith("\n"));
+    });
+
+    it("omits the header when the preamble is empty", () => {
+      assert.equal(renderScript("echo hi"), "#!/bin/bash\necho hi\n");
+      assert.equal(renderScript("echo hi", "   \n"), "#!/bin/bash\necho hi\n");
+    });
+  });
+
+  describe("writeScriptFile", () => {
+    it("writes owner-only permissions", () => {
+      withTempDir((dir) => {
+        const scriptPath = join(dir, "subagent-scripts", "launch.sh");
+        writeScriptFile(scriptPath, "#!/bin/bash\necho hi\n");
+        assert.equal(statSync(scriptPath).mode & 0o777, 0o700);
+        assert.equal(statSync(join(dir, "subagent-scripts")).mode & 0o077, 0);
+      });
+    });
+
+    it("refuses to follow a pre-planted symlink", () => {
+      withTempDir((dir) => {
+        const target = join(dir, "victim.txt");
+        writeFileSync(target, "original");
+        const scriptPath = join(dir, "launch.sh");
+        // Simulate the TOCTOU attacker: a symlink where the script will go.
+        symlinkSync(target, scriptPath);
+        assert.throws(() => writeScriptFile(scriptPath, "#!/bin/bash\ntouch /tmp/pwned\n"));
+        assert.equal(readFileSync(target, "utf8"), "original");
+      });
+    });
+
+    it("refuses to clobber an existing script", () => {
+      withTempDir((dir) => {
+        const scriptPath = join(dir, "launch.sh");
+        writeScriptFile(scriptPath, "#!/bin/bash\necho first\n");
+        assert.throws(() => writeScriptFile(scriptPath, "#!/bin/bash\necho second\n"));
+        assert.equal(readFileSync(scriptPath, "utf8"), "#!/bin/bash\necho first\n");
+      });
+    });
+  });
+
+  describe("prompt arguments (option injection)", () => {
+    it("terminates option parsing before a dash-leading task", () => {
+      const args = testApi.promptArguments(["--offline rm -rf /"]);
+      assert.equal(args[0], "--");
+      assert.equal(args[1], "'--offline rm -rf /'");
+      // Nothing before `--` and no bare value after it.
+      assert.equal(args.length, 2);
+    });
+
+    it("keeps a hostile task as one quoted argument", () => {
+      const task = "x'; touch /tmp/pwned; echo '";
+      const args = testApi.promptArguments([task]);
+      assert.deepEqual(args, ["--", shellEscape(task)]);
+      // The payload stays inside the quoted argument: the only unquoted run is
+      // the quote-escape idiom itself, so `;` never ends the shell command.
+      const body = args[1].slice(1, -1).replace(/'\\''/g, "");
+      assert.ok(!body.includes("'"), "payload must not escape its quotes");
+    });
+
+    it("keeps skill prompts and an @artifact positional after `--`", () => {
+      const args = testApi.promptArguments(["/skill:code-review", "@/tmp/context/task.md"]);
+      assert.deepEqual(args, ["--", "'/skill:code-review'", "'@/tmp/context/task.md'"]);
+    });
+
+    it("emits nothing when there is no positional argument", () => {
+      assert.deepEqual(testApi.promptArguments([]), []);
+    });
+  });
+
+  describe("cdPrefix", () => {
+    it("quotes the cwd and ends option parsing", () => {
+      assert.equal(testApi.cdPrefix("/tmp/a b"), "cd -- '/tmp/a b' && ");
+    });
+
+    it("does not let a dash-leading cwd become an option", () => {
+      assert.equal(testApi.cdPrefix("-rf"), "cd -- '-rf' && ");
+      assert.equal(testApi.cdPrefix("-"), "cd -- '-' && ");
+    });
+
+    it("is empty without a cwd", () => {
+      assert.equal(testApi.cdPrefix(null), "");
+      assert.equal(testApi.cdPrefix(undefined), "");
+      assert.equal(testApi.cdPrefix(""), "");
+    });
+  });
+
+  describe("flagWithValue", () => {
+    it("glues a dash-leading value to the flag as one token", () => {
+      const rendered = testApi.flagWithValue("--model", "--version");
+      assert.equal(rendered, "--model='--version'");
+      // A space form would be two argv entries and parsed as a flag.
+      assert.ok(!rendered.includes(" --"));
+    });
+
+    it("keeps a hostile system prompt inside one quoted token", () => {
+      const prompt = "You are a worker.\n$(id) 'quoted' \\";
+      const rendered = testApi.flagWithValue("--append-system-prompt", prompt);
+      assert.ok(rendered.startsWith("--append-system-prompt='"));
+      assert.equal(rendered, `--append-system-prompt=${shellEscape(prompt)}`);
     });
   });
 });

@@ -109,6 +109,43 @@ export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+/**
+ * Render a free-form banner as a run of `#` comment lines.
+ *
+ * Callers embed caller-supplied values (agent names, paths, surfaces) in these
+ * headers. A newline in one of those values would otherwise end the comment and
+ * turn the remainder of that value into executable script text, so every line is
+ * forced to start with `#` no matter where the line break came from.
+ */
+export function renderScriptHeader(text: string): string {
+  return text
+    .split(/\r\n|\r|\n/)
+    .map((line) => (line.length === 0 ? "#" : line.startsWith("#") ? line : `# ${line}`))
+    .join("\n");
+}
+
+/** Build the full launch-script payload. Exported so tests can assert on it. */
+export function renderScript(command: string, preamble?: string): string {
+  const lines = ["#!/bin/bash"];
+  const header = preamble?.trimEnd();
+  if (header) lines.push(renderScriptHeader(header));
+  lines.push(command);
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Write a launch script with owner-only permissions.
+ *
+ * The script carries the task text, which may hold secrets, so it must not be
+ * readable by other local users (`0o700`, not the old `0o755`). `wx` is
+ * `O_CREAT|O_EXCL`, which both refuses to clobber an existing file and refuses
+ * to follow a pre-planted symlink at that path.
+ */
+export function writeScriptFile(scriptPath: string, text: string): void {
+  mkdirSync(dirname(scriptPath), { recursive: true, mode: 0o700 });
+  writeFileSync(scriptPath, text, { mode: 0o700, flag: "wx" });
+}
+
 // ── Surface primitives ──
 
 /**
@@ -173,17 +210,8 @@ export function sendLongCommand(
       "pi-subagent-scripts",
       `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
     );
-  mkdirSync(dirname(scriptPath), { recursive: true });
 
-  const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
-  }
-  scriptParts.push(command);
-
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
+  writeScriptFile(scriptPath, renderScript(command, options?.scriptPreamble));
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }

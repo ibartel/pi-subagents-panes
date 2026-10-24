@@ -56,6 +56,9 @@ import {
   observeStatus,
   loadExtensionConfig,
   parseDisplayConfig,
+  THINKING_LEVELS,
+  type ArchitectConfig,
+  type ModelsConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -88,6 +91,37 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
   (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+}
+
+/**
+ * Render positional prompt arguments for a child CLI as a shell-safe argv tail.
+ *
+ * `shellEscape` makes each value shell-safe, but a task beginning with `-` would
+ * still be parsed as an option by pi and claude (`-x` is an "unknown option" in
+ * pi and drops the task entirely; `--offline` sets a real flag). `--` ends option
+ * parsing for both CLIs; pi keeps `@file` arguments as file references after it.
+ */
+function promptArguments(args: string[]): string[] {
+  return args.length > 0 ? ["--", ...args.map((arg) => shellEscape(arg))] : [];
+}
+
+/**
+ * Render `--flag=value` as one shell token.
+ *
+ * Some CLIs (claude) do not consume a `-`-leading value in the space-separated
+ * form — `--model --version` is read as two flags — so the value is glued on
+ * with `=` and shell-quoted as a single argv entry.
+ */
+function flagWithValue(flag: string, value: string): string {
+  return `${flag}=${shellEscape(value)}`;
+}
+
+/**
+ * `cd` into the subagent's cwd. `--` keeps a directory whose name starts with
+ * `-` from being read as an option (`cd -` means OLDPWD, `cd -rf` is an error).
+ */
+function cdPrefix(cwd: string | null | undefined): string {
+  return cwd ? `cd -- ${shellEscape(cwd)} && ` : "";
 }
 
 function getModuleAbortSignal(): AbortSignal {
@@ -168,6 +202,15 @@ const SPAWNING_TOOLS = [
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+
+/**
+ * Catalog tool for planners. Registered by this extension, so a restricted
+ * child that lists `models` in its tools gets this file loaded via `-e`.
+ */
+const MODELS_TOOL = "models";
+
+/** Bundled planning agent; `architect.mode` changes how it behaves. */
+const ARCHITECT_AGENT_NAME = "architect";
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
@@ -258,8 +301,8 @@ export function refreshToolSourcePaths(pi?: ExtensionAPI | null): void {
  */
 function getToolExtensionPath(tool: string): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
-  if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
+  // The spawning tools and the model catalog are registered by THIS extension.
+  if (tool === MODELS_TOOL || (SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
 
@@ -588,6 +631,8 @@ const extensionConfig = loadExtensionConfig();
 const statusConfig = extensionConfig.status;
 const displayConfig = extensionConfig.display;
 const defaultsConfig = extensionConfig.defaults;
+const modelsConfig = extensionConfig.models;
+const architectConfig = extensionConfig.architect;
 configureSurfaces(displayConfig.multiplexer);
 
 /**
@@ -614,11 +659,19 @@ export function resolveExecutionTarget(input: {
   configThinking?: string;
   parentThinking?: string | null;
 }): { model?: string; thinking?: string } {
-  const explicitModel = firstNonEmpty(input.requestedModel, input.agentModel, input.configModel);
+  // A model selector may carry a `:thinking` suffix (config tiers use this so
+  // one entry pins both). Split it off here, otherwise the suffix would be
+  // appended a second time when the child command is built.
+  const candidates = [input.requestedModel, input.agentModel, input.configModel].map((value) =>
+    value == null ? { selector: "", thinking: undefined as string | undefined } : splitThinkingSuffix(value),
+  );
+  const explicit = candidates.find((candidate) => candidate.selector !== "");
+  const explicitModel = explicit?.selector;
   const model = explicitModel ?? firstNonEmpty(input.parentModel);
   const inheritsParentModel = explicitModel === undefined;
 
   const thinking = firstNonEmpty(
+    explicit?.thinking,
     input.agentThinking,
     input.configThinking,
     inheritsParentModel ? input.parentThinking : undefined,
@@ -635,6 +688,276 @@ function firstNonEmpty(...values: Array<string | undefined | null>): string | un
     if (trimmed !== "") return trimmed;
   }
   return undefined;
+}
+
+// ── Model catalog for planners ──────────────────────────────────────────────
+// The facts (cost, context window, thinking support, credentials) come from pi's
+// model registry. Optional config adds judgement pi cannot know: annotations,
+// tiers, and excludes.
+
+/** One catalog row, as shown to a planner. */
+export interface ModelRow {
+  /** `provider/id` — what `subagent({ model })` accepts. */
+  selector: string;
+  provider: string;
+  id: string;
+  inputCost: number;
+  outputCost: number;
+  contextWindow: number;
+  maxTokens: number;
+  thinkingLevels: string[];
+  available: boolean;
+  /** Your own note from config `models.annotations`. */
+  note?: string;
+  /** Config tiers this model belongs to. */
+  tiers: string[];
+  /**
+   * Thinking level each tier pins for this model, keyed by tier name. A model in
+   * several tiers has a different level in each (`cheap:high`, `allround:xhigh`).
+   */
+  tierThinking?: Record<string, string>;
+  /** False when the catalog carries no price for this model (shown as `?`). */
+  costKnown: boolean;
+}
+
+function globToRegExp(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+/**
+ * Split a `selector:thinking` entry. Config tiers and `subagent({ model })`
+ * both accept this suffix so a tier can pin a thinking level with the model.
+ * A `:` that does not end in a known level is treated as part of the id.
+ */
+export function splitThinkingSuffix(value: string): { selector: string; thinking?: string } {
+  const trimmed = value.trim();
+  const index = trimmed.lastIndexOf(":");
+  if (index <= 0) return { selector: trimmed };
+  const suffix = trimmed.slice(index + 1).trim();
+  if (!(THINKING_LEVELS as readonly string[]).includes(suffix)) return { selector: trimmed };
+  return { selector: trimmed.slice(0, index).trim(), thinking: suffix };
+}
+
+/** Match a config selector against a row: exact, `provider/*`, or `*substring*`. */
+export function matchesModelSelector(selector: string, id: string, pattern: string): boolean {
+  const trimmed = splitThinkingSuffix(pattern).selector;
+  if (!trimmed) return false;
+  if (trimmed === selector || trimmed === id) return true;
+  const regex = globToRegExp(trimmed);
+  return regex.test(selector) || regex.test(id);
+}
+
+export interface ModelQuery {
+  tier?: string;
+  provider?: string;
+  needsReasoning?: boolean;
+  maxInputCost?: number;
+  minContext?: number;
+  limit?: number;
+  includeUnavailable?: boolean;
+}
+
+/**
+ * Filter + rank catalog rows for a planner query. Pure so it can be unit tested
+ * without a live model registry.
+ */
+export function selectModelRows(
+  rows: ModelRow[],
+  query: ModelQuery,
+  config: { exclude: string[] },
+): ModelRow[] {
+  const selected = rows.filter((row) => {
+    if (!query.includeUnavailable && !row.available) return false;
+    if (query.provider && row.provider !== query.provider) return false;
+    if (query.needsReasoning && row.thinkingLevels.length === 0) return false;
+    if (query.maxInputCost !== undefined && (!row.costKnown || row.inputCost > query.maxInputCost)) {
+      return false;
+    }
+    if (query.minContext !== undefined && row.contextWindow < query.minContext) return false;
+    if (query.tier && !row.tiers.includes(query.tier)) return false;
+    if (config.exclude.some((pattern) => matchesModelSelector(row.selector, row.id, pattern))) {
+      return false;
+    }
+    return true;
+  });
+
+  // Known prices first (cheapest first), then unpriced models by widest
+  // context. Many catalog entries carry no cost at all; ranking them as "$0.00"
+  // would put unknown-cost models ahead of genuinely cheap ones.
+  selected.sort(
+    (a, b) =>
+      Number(b.costKnown) - Number(a.costKnown) ||
+      a.inputCost - b.inputCost ||
+      b.contextWindow - a.contextWindow ||
+      a.selector.localeCompare(b.selector),
+  );
+
+  return selected.slice(0, query.limit ?? 12);
+}
+
+/** Render rows as a compact aligned table for a model to read. */
+export function formatModelTable(rows: ModelRow[]): string {
+  if (rows.length === 0) return "No models matched. Loosen the filters (drop tier/maxInputCost) and retry.";
+
+  const lines = rows.map((row) => {
+    const cost = row.costKnown
+      ? `$${row.inputCost.toFixed(2)}/$${row.outputCost.toFixed(2)}`
+      : "?/?";
+    const ctx = `${Math.round(row.contextWindow / 1000)}k`;
+    const think = row.thinkingLevels.length > 0 ? row.thinkingLevels.join(",") : "-";
+    const tierFlags = row.tiers.map((tier) => {
+      const level = row.tierThinking?.[tier];
+      return level ? `${tier}:${level}` : tier;
+    });
+    const flags = [row.available ? "" : "no-auth", ...tierFlags, row.note ?? ""]
+      .filter(Boolean)
+      .join("; ");
+    return { row, cost, ctx, think, flags };
+  });
+
+  const selectorWidth = Math.min(64, Math.max(...lines.map((line) => line.row.selector.length)));
+  return lines
+    .map(({ row, cost, ctx, think, flags }) => {
+      const selector = row.selector.length > selectorWidth
+        ? `…${row.selector.slice(-(selectorWidth - 1))}`
+        : row.selector.padEnd(selectorWidth);
+      const base = `${selector}  ${cost.padEnd(13)} ${ctx.padStart(5)}  ${think.padEnd(18)}`;
+      return flags ? `${base} ${flags}` : base.trimEnd();
+    })
+    .join("\n");
+}
+
+/**
+ * Structural view of the bits of pi's model registry the catalog needs. Kept
+ * narrow so tests can pass a fake registry without constructing real Models.
+ */
+export interface ModelRegistryLike {
+  getAll(): Array<{
+    provider: string;
+    id: string;
+    cost?: { input?: number; output?: number };
+    contextWindow?: number;
+    maxTokens?: number;
+    reasoning?: boolean;
+    thinkingLevelMap?: Record<string, unknown> | null;
+  }>;
+  hasConfiguredAuth(model: unknown): boolean;
+}
+
+/**
+ * Thinking levels a model actually supports. An explicit map is authoritative
+ * (a `null` value marks a level as unsupported); otherwise any reasoning model
+ * accepts the full ladder and a non-reasoning model accepts none.
+ */
+export function thinkingLevelsFor(model: {
+  reasoning?: boolean;
+  thinkingLevelMap?: Record<string, unknown> | null;
+}): string[] {
+  const map = model.thinkingLevelMap;
+  if (map && typeof map === "object") {
+    return Object.entries(map)
+      .filter(([, value]) => value !== null && value !== undefined)
+      .map(([level]) => level);
+  }
+  return model.reasoning ? [...THINKING_LEVELS] : [];
+}
+
+/**
+ * Refuse a spawn that would exceed the configured caps.
+ *
+ * Returns an error message, or null when the spawn may proceed. Pure so the
+ * limit logic can be tested without a multiplexer or a live session.
+ */
+export function checkSpawnLimits(
+  input: { depth: number; spawnedThisRun: number },
+  limits: { maxAgents: number; maxDepth: number },
+): string | null {
+  if (limits.maxDepth > 0 && input.depth > limits.maxDepth) {
+    return (
+      `Refused: cascade depth limit reached (this spawn would be depth ${input.depth}, ` +
+      `architect.maxDepth is ${limits.maxDepth}). Do the work yourself at this level, ` +
+      `or raise architect.maxDepth in config.json.`
+    );
+  }
+
+  if (limits.maxAgents > 0 && input.spawnedThisRun >= limits.maxAgents) {
+    return (
+      `Refused: subagent budget exhausted (already launched ${input.spawnedThisRun}, ` +
+      `architect.maxAgents is ${limits.maxAgents}). Finish with what you have, or raise ` +
+      `architect.maxAgents in config.json.`
+    );
+  }
+
+  return null;
+}
+
+/** Build catalog rows from a live model registry plus the configured policy. */
+export function buildModelRows(registry: ModelRegistryLike, config: ModelsConfig): ModelRow[] {
+  const rows: ModelRow[] = [];
+
+  for (const model of registry.getAll()) {
+    const selector = `${model.provider}/${model.id}`;
+    const tierEntries = Object.entries(config.tiers).flatMap(([tier, patterns]) =>
+      patterns
+        .filter((pattern) => matchesModelSelector(selector, model.id, pattern))
+        .map((pattern) => ({ tier, thinking: splitThinkingSuffix(pattern).thinking })),
+    );
+    const tiers = [...new Set(tierEntries.map((entry) => entry.tier))];
+    const tierThinking: Record<string, string> = {};
+    for (const entry of tierEntries) {
+      if (entry.thinking) tierThinking[entry.tier] = entry.thinking;
+    }
+    const note = Object.entries(config.annotations).find(([pattern]) =>
+      matchesModelSelector(selector, model.id, pattern),
+    )?.[1];
+
+    let available = false;
+    try {
+      available = registry.hasConfiguredAuth(model);
+    } catch {
+      // A provider whose auth cannot be resolved is simply unavailable.
+      available = false;
+    }
+
+    rows.push({
+      selector,
+      provider: model.provider,
+      id: model.id,
+      inputCost: model.cost?.input ?? 0,
+      outputCost: model.cost?.output ?? 0,
+      costKnown: (model.cost?.input ?? 0) > 0 || (model.cost?.output ?? 0) > 0,
+      contextWindow: model.contextWindow ?? 0,
+      maxTokens: model.maxTokens ?? 0,
+      thinkingLevels: thinkingLevelsFor(model),
+      available,
+      ...(note ? { note } : {}),
+      tiers,
+      ...(Object.keys(tierThinking).length > 0 ? { tierThinking } : {}),
+    });
+  }
+
+  return rows;
+}
+/**
+ * Instruction block handed to the `architect` agent describing how much
+ * autonomy it has and what its caps are. Config lives in the parent's
+ * config.json, which the child process never reads itself.
+ */
+export function formatArchitectDirective(config: ArchitectConfig): string {
+  const caps = [
+    config.maxAgents > 0 ? `at most ${config.maxAgents} subagents in this run` : "no subagent count cap",
+    config.maxDepth > 0 ? `cascade depth at most ${config.maxDepth}` : "no depth cap",
+  ].join(", ");
+
+  const modeText =
+    config.mode === "plan"
+      ? "AUTONOMY: plan-only. You do NOT have spawning tools. Produce the plan and stop; the caller decides what to run."
+      : config.mode === "confirm"
+        ? "AUTONOMY: confirm-first. Before spawning anything, call ask_question with your plan and wait for approval. If approved, spawn exactly what the plan says."
+        : "AUTONOMY: execute. Spawn the plan immediately without asking, then report what each agent produced.";
+
+  return `## Operating limits (from config)\n${modeText}\nHard limits: ${caps}. Exceeding them fails the spawn.`;
 }
 
 /**
@@ -767,6 +1090,12 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+/**
+ * How many subagents this process has launched. A child pi process is one
+ * spawning run, so a per-process counter is exactly `architect.maxAgents`.
+ */
+let spawnedThisRun = 0;
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -1010,6 +1339,40 @@ function buildSubagentToolAllowlist(
   }
 
   return [...allow].join(",");
+}
+
+/**
+ * Should this agent be granted the spawning toolset?
+ *
+ * An agent with a non-empty `subagent_agents` list normally gets it. The one
+ * exception is the bundled architect under `architect.mode: "plan"`: plan mode
+ * withdraws the spawning tools entirely, so a plan-only architect cannot spawn
+ * even when its own frontmatter still declares `subagent_agents`.
+ */
+function resolveGrantSpawning(
+  agentName: string | null | undefined,
+  agentDefs: AgentDefaults | null,
+  architectConfig: ArchitectConfig,
+): boolean {
+  const planOnlyArchitect =
+    agentName === ARCHITECT_AGENT_NAME && architectConfig.mode === "plan";
+  const canSpawn = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  return canSpawn && !planOnlyArchitect;
+}
+
+/**
+ * The tool allowlist a given agent actually launches with. Single source of
+ * truth for the `--tools` value of both the initial launch and a resume, so the
+ * autonomy-mode rule above cannot drift from what the child is granted.
+ */
+function resolveSubagentToolAllowlist(
+  agentName: string | null | undefined,
+  agentDefs: AgentDefaults | null,
+  architectConfig: ArchitectConfig,
+): string | null {
+  return buildSubagentToolAllowlist(agentDefs?.tools, {
+    grantSpawning: resolveGrantSpawning(agentName, agentDefs, architectConfig),
+  });
 }
 
 /**
@@ -1339,9 +1702,14 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
+  resolveGrantSpawning,
+  resolveSubagentToolAllowlist,
   applySandboxToParts,
   resolveExecutionTarget,
   buildPiPromptArgs,
+  promptArguments,
+  cdPrefix,
+  flagWithValue,
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
@@ -1397,6 +1765,15 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
+  // Depth: every spawned process carries its own depth, so a grandchild knows
+  // it is one level deeper. Budget: per process = per spawning run.
+  const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0") + 1;
+  const budgetError = checkSpawnLimits({ depth, spawnedThisRun }, architectConfig);
+  if (budgetError) throw new Error(budgetError);
+  // Count here, not at the end: every launch path (pi, claude CLI, parallel
+  // pre-created surfaces) passes this point exactly once, so the budget cannot
+  // be bypassed by a path that returns early.
+  spawnedThisRun += 1;
   // The tool handler always resolves a unique name before launching; the schema
   // keeps it optional because callers may omit it.
   const name = params.name ?? params.agent;
@@ -1415,7 +1792,6 @@ async function launchSubagent(
     parentThinking: ctx.thinkingLevel ?? null,
   });
   const effectiveModel = executionTarget.model;
-  const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = executionTarget.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
@@ -1476,14 +1852,20 @@ async function launchSubagent(
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
   // An agent with a non-empty subagent_agents list is granted the spawning
   // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  // `architect.mode: "plan"` withdraws the spawning toolset entirely, so a
+  // plan-only architect literally cannot spawn even if it tries.
+  const grantSpawning = resolveGrantSpawning(params.agent ?? null, agentDefs, architectConfig);
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
+  // The autonomy mode is configuration, so it has to reach the agent as text:
+  // the agent file cannot read the user's config.json itself.
+  const autonomyBlock =
+    params.agent === ARCHITECT_AGENT_NAME ? `\n\n${formatArchitectDirective(architectConfig)}` : "";
   const fullTask = inheritsConversationContext
-    ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    ? `${params.task}${autonomyBlock}`
+    : `${roleBlock}\n\n${modeHint}\n\n${params.task}${autonomyBlock}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
@@ -1499,20 +1881,23 @@ async function launchSubagent(
     }
 
     if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
+      // `=` form: claude's parser refuses a `-`-leading value in the space form,
+      // so `--model --version` would be read as two flags. The model selector
+      // comes from config/model catalogs and the agent body from an agent file,
+      // so neither value shape is trusted.
+      cmdParts.push(flagWithValue("--model", effectiveModel));
     }
 
     const sp = agentDefs.body;
     if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
+      cmdParts.push(flagWithValue("--append-system-prompt", sp));
     }
 
     // Always pass the task as the prompt — even for resumed sessions,
     // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
+    cmdParts.push(...promptArguments([params.task]));
 
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix(effectiveCwd)}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
     const launchScriptName = `${(name || "subagent")
       .toLowerCase()
@@ -1574,7 +1959,11 @@ async function launchSubagent(
   // spawning toolset), we disable global extension discovery and re-enable only
   // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
   // restriction keep their full default toolset and all global extensions.
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+  const toolAllowlist = resolveSubagentToolAllowlist(
+    params.agent ?? null,
+    agentDefs,
+    architectConfig,
+  );
 
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
@@ -1609,6 +1998,7 @@ async function launchSubagent(
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
+  envParts.push(`PI_SUBAGENT_DEPTH=${depth}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
@@ -1643,19 +2033,19 @@ async function launchSubagent(
     taskArg = `@${artifactPath}`;
   }
 
-  for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
-    taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
-  }
+  parts.push(
+    ...promptArguments(
+      buildPiPromptArgs({
+        effectiveSkills,
+        taskDelivery: launchBehavior.taskDelivery,
+        taskArg,
+      }),
+    ),
+  );
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  const piCommand = cdPrefix(effectiveCwd) + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
   const launchScriptName = `${(name || "subagent")
     .toLowerCase()
@@ -2197,6 +2587,58 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── models tool ──
+  // Gives a planner live facts about what it can pick: cost, context window,
+  // thinking support and credential status, plus any annotations/tiers from
+  // config. Without this an architect can only guess at model names.
+  pi.registerTool({
+    name: MODELS_TOOL,
+    label: "Models",
+    description:
+      "List selectable models with cost, context window, thinking-level support and credential status. " +
+      "Call this BEFORE choosing a model for a subagent instead of guessing model ids. " +
+      "Returns one line per model: `provider/id  $input/$output per Mtok  context  thinking-levels  notes`. " +
+      "Cheapest first. Filter with tier (from config), provider, needsReasoning, maxInputCost, minContext.",
+    promptSnippet:
+      "List models with cost, context window and thinking support (call before picking a model).",
+    promptGuidelines: [
+      "Call `models` before choosing a model for a subagent; do not invent model ids.",
+      "Prefer the cheapest model that can do the job: cheap model for search/recon, strong model for code changes and review.",
+    ],
+    parameters: Type.Object({
+      tier: Type.Optional(
+        Type.String({ description: "Only models in this configured tier (config.json models.tiers), e.g. cheap or deep" }),
+      ),
+      provider: Type.Optional(Type.String({ description: "Only models from this provider id" })),
+      needsReasoning: Type.Optional(
+        Type.Boolean({ description: "Only models that support a thinking level" }),
+      ),
+      maxInputCost: Type.Optional(
+        Type.Number({ description: "Maximum input cost in USD per million tokens" }),
+      ),
+      minContext: Type.Optional(
+        Type.Number({ description: "Minimum context window in tokens" }),
+      ),
+      limit: Type.Optional(Type.Number({ description: "Maximum rows to return (default 12)" })),
+      includeUnavailable: Type.Optional(
+        Type.Boolean({ description: "Include models without working credentials (default false)" }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const query = params as ModelQuery;
+      const rows = buildModelRows(ctx.modelRegistry, modelsConfig);
+      const selected = selectModelRows(rows, query, modelsConfig);
+      const header =
+        `models (${selected.length} of ${rows.length}) — ` +
+        `cost is USD per Mtok input/output, thinking lists supported levels`;
+      return {
+        content: [{ type: "text" as const, text: `${header}\n${formatModelTable(selected)}` }],
+        details: { count: selected.length, total: rows.length },
+      };
+    },
+  });
+
   // ── subagents_list tool ──
   pi.registerTool({
       name: "subagents_list",
@@ -2433,7 +2875,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
+          parts.push(...promptArguments([`@${resumeMsgFile}`]));
         }
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
@@ -2461,9 +2903,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
         // operate where they did before.
-        const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
-
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${cdPrefix(loadout.cwd)}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",

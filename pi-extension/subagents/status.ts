@@ -321,6 +321,8 @@ export interface ExtensionConfig {
   status: StatusConfig;
   display: DisplayConfig;
   defaults: DefaultsConfig;
+  models: ModelsConfig;
+  architect: ArchitectConfig;
 }
 
 function readParsedConfig(
@@ -350,6 +352,141 @@ export function loadExtensionConfig(
     status: parseStatusConfig(parsed, sourcePath),
     display: parseDisplayConfig(parsed, sourcePath),
     defaults: parseDefaultsConfig(parsed, sourcePath),
+    models: parseModelsConfig(parsed, sourcePath),
+    architect: parseArchitectConfig(parsed, sourcePath),
+  };
+}
+
+// ── Model catalog policy (annotations / excludes / tiers) ───────────────────
+// The facts (cost, context window, reasoning support) come from pi's model
+// registry at runtime. This block only carries what pi cannot know: your own
+// judgement about a model, and which models to hide or group.
+
+export interface ModelsConfig {
+  /** Free-form notes per model selector, shown to the planner. */
+  annotations: Record<string, string>;
+  /** Glob-ish selectors (`*experimental*`) never offered to the planner. */
+  exclude: string[];
+  /** Named shortlists, e.g. `{ cheap: [...], deep: [...] }`. */
+  tiers: Record<string, string[]>;
+}
+
+export const DEFAULT_MODELS_CONFIG: ModelsConfig = {
+  annotations: {},
+  exclude: [],
+  tiers: {},
+};
+
+function requireStringArray(value: unknown, source: string, fieldName: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    invalidStatusConfig(source, `${fieldName} must be an array of strings`);
+  }
+  return (value as string[]).map((entry) => entry.trim()).filter(Boolean);
+}
+
+export function parseModelsConfig(rawConfig: unknown, source = "config.json"): ModelsConfig {
+  const config = requireObject(rawConfig, source, "root");
+  if (config.models === undefined) {
+    return { annotations: {}, exclude: [], tiers: {} };
+  }
+
+  const models = requireObject(config.models, source, "models");
+  rejectUnsupportedKeys(models, ["annotations", "exclude", "tiers"], source, "models");
+
+  const result: ModelsConfig = { annotations: {}, exclude: [], tiers: {} };
+
+  if (models.annotations !== undefined) {
+    const raw = requireObject(models.annotations, source, "models.annotations");
+    for (const [selector, note] of Object.entries(raw)) {
+      if (typeof note !== "string") {
+        invalidStatusConfig(source, `models.annotations.${selector} must be a string`);
+      }
+      const trimmed = note.trim();
+      if (trimmed) result.annotations[selector.trim()] = trimmed;
+    }
+  }
+
+  if (models.exclude !== undefined) {
+    result.exclude = requireStringArray(models.exclude, source, "models.exclude");
+  }
+
+  if (models.tiers !== undefined) {
+    const raw = requireObject(models.tiers, source, "models.tiers");
+    for (const [tier, models_] of Object.entries(raw)) {
+      const entries = requireStringArray(models_, source, `models.tiers.${tier}`);
+      for (const entry of entries) {
+        // `selector:thinking` is allowed; anything after the last `:` that is not
+        // a known level would silently never match a model, so reject it loudly.
+        const suffix = entry.includes(":") ? entry.slice(entry.lastIndexOf(":") + 1).trim() : null;
+        if (suffix !== null && !isThinkingLevelName(suffix)) {
+          invalidStatusConfig(
+            source,
+            `models.tiers.${tier} entry ${JSON.stringify(entry)} has an invalid thinking level ` +
+              `(expected one of ${THINKING_LEVELS.join(", ")})`,
+          );
+        }
+      }
+      result.tiers[tier] = entries;
+    }
+  }
+
+  return result;
+}
+
+// ── Architect policy ────────────────────────────────────────────────────────
+// How the bundled `architect` agent behaves, and the hard caps every spawning
+// process obeys. Caps are enforced in code, not just requested in a prompt.
+
+export const AUTONOMY_MODES = ["plan", "confirm", "auto"] as const;
+export type AutonomyMode = (typeof AUTONOMY_MODES)[number];
+
+export interface ArchitectConfig {
+  /** `plan`: never spawns. `confirm`: asks before spawning. `auto`: spawns immediately. */
+  mode: AutonomyMode;
+  /** Max subagents one spawning run may launch. 0 disables the cap. */
+  maxAgents: number;
+  /** Max cascade depth (architect → child → grandchild). 0 disables the cap. */
+  maxDepth: number;
+}
+
+export const DEFAULT_ARCHITECT_CONFIG: ArchitectConfig = {
+  mode: "confirm",
+  maxAgents: 4,
+  maxDepth: 2,
+};
+
+function requireNonNegativeInteger(value: unknown, source: string, fieldName: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    invalidStatusConfig(source, `${fieldName} must be a non-negative integer`);
+  }
+  return value;
+}
+
+export function parseArchitectConfig(rawConfig: unknown, source = "config.json"): ArchitectConfig {
+  const config = requireObject(rawConfig, source, "root");
+  if (config.architect === undefined) return { ...DEFAULT_ARCHITECT_CONFIG };
+
+  const architect = requireObject(config.architect, source, "architect");
+  rejectUnsupportedKeys(architect, ["mode", "maxAgents", "maxDepth"], source, "architect");
+
+  const mode = architect.mode === undefined ? DEFAULT_ARCHITECT_CONFIG.mode : architect.mode;
+  if (typeof mode !== "string" || !(AUTONOMY_MODES as readonly string[]).includes(mode)) {
+    invalidStatusConfig(
+      source,
+      `architect.mode must be one of ${AUTONOMY_MODES.join(", ")} (got ${JSON.stringify(mode)})`,
+    );
+  }
+
+  return {
+    mode: mode as AutonomyMode,
+    maxAgents:
+      architect.maxAgents === undefined
+        ? DEFAULT_ARCHITECT_CONFIG.maxAgents
+        : requireNonNegativeInteger(architect.maxAgents, source, "architect.maxAgents"),
+    maxDepth:
+      architect.maxDepth === undefined
+        ? DEFAULT_ARCHITECT_CONFIG.maxDepth
+        : requireNonNegativeInteger(architect.maxDepth, source, "architect.maxDepth"),
   };
 }
 

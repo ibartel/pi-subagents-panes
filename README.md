@@ -63,9 +63,13 @@ gitignored):
     "nestedMode": "splitDown",
     "multiplexer": "auto"
   },
-  "defaults": {
-    "thinking": "medium"
-  }
+  "defaults": {},
+  "models": {
+    "exclude": ["*experimental*"],
+    "tiers": { "cheap": ["*flash*:high"], "deep": ["anthropic/*sonnet*:max"] },
+    "annotations": { "*flash*": "cheap recon; weak on large refactors" }
+  },
+  "architect": { "mode": "confirm", "maxAgents": 4, "maxDepth": 2 }
 }
 ```
 
@@ -77,6 +81,12 @@ gitignored):
 | `status.enabled` | boolean | `true` | Show the running-subagents widget |
 | `defaults.model` | model selector (`provider/id`) | inherit parent | Model for agents that do not set `model:` |
 | `defaults.thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | inherit parent | Thinking level for agents that do not set `thinking:` |
+| `models.exclude` | glob selectors (`*experimental*`) | none | Models never offered by the `models` tool |
+| `models.tiers` | `{ name: [selector[:thinking], …] }` | none | Named shortlists the planner can filter by. An entry may pin a thinking level: `"*flash*:high"` |
+| `models.annotations` | `{ selector: "note" }` | none | Your own judgement, shown next to the model |
+| `architect.mode` | `plan`, `confirm`, `auto` | `confirm` | Whether the architect only plans, asks first, or executes |
+| `architect.maxAgents` | integer, `0` = unlimited | `4` | Hard cap on subagents launched by one spawning run |
+| `architect.maxDepth` | integer, `0` = unlimited | `2` | Hard cap on cascade depth |
 
 A per-agent `display:` in frontmatter overrides both modes for that agent, at any depth.
 
@@ -106,6 +116,7 @@ Changes are read at pi startup (and on `/reload`).
 | `subagent` | Spawn a sub-agent in its own surface (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
+| `models` | List models with cost, context window, thinking support and credentials — call before choosing a model |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
@@ -178,9 +189,52 @@ parent propagates to all of them. Set `model:` in the frontmatter (or `defaults.
 | **debugger** | high | `read`, `grep`, `find`, `ls`, `bash`, `edit` | Reproduces a failure, narrows to the cause, proves a minimal fix |
 | **tester** | medium | `read`, `write`, `edit`, `grep`, `find`, `ls`, `bash` | Writes focused tests and runs them to green |
 | **scribe** | medium | `read`, `write`, `grep`, `find`, `ls`, `bash` | Documentation that matches the code |
+| **architect** | high | `read`, `grep`, `find`, `ls`, `bash`, `models` + spawning | Plans agent cascade and model choice, then runs it |
 
 All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt
-(`system-prompt: append`). `worker` is the only one that can spawn others.
+(`system-prompt: append`). `worker` may spawn `scout` and `researcher`; `architect` may spawn any of
+them (see below).
+
+## Architect
+
+`subagent({ agent: "architect", task })` asks a planner to decide *how* the work runs: which agents,
+in what order, and which model each one gets. It classifies complexity first, calls `models` for
+live cost/context/thinking facts, and justifies every spawn in one line.
+
+```typescript
+subagent({ agent: "architect", task: "Add rate limiting to the public API" });
+```
+
+**Model data comes from pi, not from config.** `models` reads the live registry — cost per Mtok,
+context window, supported thinking levels, credential status. Config only adds what pi cannot know:
+`models.annotations` (your judgement), `models.tiers` (named shortlists), `models.exclude`
+(models to hide). Annotations and tiers accept globs: `deepseek/*`, `*flash*`, `anthropic/*sonnet*`.
+
+A tier entry may pin the thinking level the planner should use for it:
+
+```json
+"tiers": { "cheap": ["*flash*:high"], "allround": ["deepseek/*-1017:xhigh"], "deep": ["anthropic/*sonnet*:max"] }
+```
+
+The `models` tool shows these as `allround:xhigh`, and the architect passes `selector:xhigh` to
+`subagent({ model })`. The suffix sets the child's thinking level, so the tier's level follows the
+model automatically instead of relying on the agent's own `thinking:` default.
+
+**Autonomy is configurable** via `architect.mode`:
+
+| Mode | Behaviour |
+| ---- | --------- |
+| `plan` | Plans and stops. The spawning toolset is withdrawn, so it *cannot* spawn |
+| `confirm` | Calls `ask_question` with the plan, waits for approval, then spawns |
+| `auto` | Plans and spawns immediately |
+
+**Caps are enforced in code, not requested in a prompt.** `architect.maxAgents` counts spawns per
+spawning run (one process), `architect.maxDepth` refuses spawns past the cascade depth. Exceeding
+either fails the spawn with an explanation, so a runaway plan cannot quietly fan out.
+
+The cascade itself is emergent: each agent's `subagent_agents:` list decides who *it* may spawn, so
+the shape is `architect → worker → scout`. With the default `maxDepth: 2`, an architect's direct
+children may not spawn grandchildren.
 
 ## Custom agents
 

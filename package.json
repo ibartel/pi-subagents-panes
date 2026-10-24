@@ -19,7 +19,7 @@
   ],
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts test/surfaces.test.ts",
+    "test": "node --test test/test.ts test/surfaces.test.ts test/plan-mode-architect.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
