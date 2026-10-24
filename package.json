@@ -1,0 +1,43 @@
+{
+  "name": "pi-subagents-panes",
+  "version": "4.0.0",
+  "description": "Async subagents for pi, displayed as tabs or splits in Orca, herdr, or tmux",
+  "keywords": [
+    "pi-package",
+    "subagents",
+    "tmux",
+    "herdr",
+    "orca"
+  ],
+  "license": "MIT",
+  "author": "Ingo Bartel",
+  "contributors": [
+    {
+      "name": "Amos Blomqvist",
+      "url": "https://github.com/amosblomqvist"
+    }
+  ],
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/test.ts test/surfaces.test.ts",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/subagents/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@earendil-works/pi-tui": "^1.4.0",
+    "@sinclair/typebox": "^0.34.52",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}

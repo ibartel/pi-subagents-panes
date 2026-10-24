@@ -1,0 +1,11 @@
+{
+  "status": {
+    "enabled": true
+  },
+  "display": {
+    "mode": "splitRight",
+    "nestedMode": "splitDown",
+    "multiplexer": "auto"
+  },
+  "defaults": {}
+}
