@@ -247,19 +247,28 @@ export default function (pi: ExtensionAPI) {
       // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      if (sessionFile) {
+        // Always leave a sidecar. A clean exit used to rely on the parent
+        // scraping `echo __SUBAGENT_DONE_...__` off the terminal, which fails
+        // whenever the screen scrolls past it or the pane is gone — the parent
+        // then polled forever while the subagent was long finished. A file is
+        // deterministic.
         try {
           writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
+            `${sessionFile}${errorInfo ? ".exit" : ".done"}`,
+            JSON.stringify(
+              errorInfo
+                ? {
+                    type: "error",
+                    errorMessage: errorInfo.errorMessage,
+                    stopReason: errorInfo.stopReason,
+                  }
+                : { type: "done", exitCode: 0, at: Date.now() },
+            ),
           );
         } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
+          // Best effort — the screen sentinel and the session file are the
+          // fallbacks when the sidecar cannot be written.
         }
       }
 

@@ -25,6 +25,7 @@ import {
   resetSessionIndexCache,
   resolveSessionFileById,
   findLastAssistantMessage,
+  findLastTodoState,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
@@ -2023,6 +2024,35 @@ describe("tmux.ts interpretExitSidecar", () => {
     });
   });
 
+  it("reads and consumes a clean-exit .done sidecar", () => {
+    // Regression: a clean auto-exit wrote no sidecar, so the parent relied on
+    // scraping the terminal sentinel and polled forever when it scrolled away.
+    const { readExitSidecar } = __pollForExitTest__;
+    const dir = mkdtempSync(join(tmpdir(), "pi-sidecar-"));
+    const sessionFile = join(dir, "session.jsonl");
+    writeFileSync(`${sessionFile}.done`, JSON.stringify({ type: "done", exitCode: 0 }));
+    try {
+      assert.deepEqual(readExitSidecar(sessionFile), { reason: "done", exitCode: 0 });
+      assert.equal(existsSync(`${sessionFile}.done`), false, "sidecar is consumed once read");
+      assert.equal(readExitSidecar(sessionFile), null, "second read finds nothing");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers .done over a stale .exit error sidecar", () => {
+    const { readExitSidecar } = __pollForExitTest__;
+    const dir = mkdtempSync(join(tmpdir(), "pi-sidecar2-"));
+    const sessionFile = join(dir, "session.jsonl");
+    writeFileSync(`${sessionFile}.done`, JSON.stringify({ type: "done" }));
+    writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: "old" }));
+    try {
+      assert.deepEqual(readExitSidecar(sessionFile), { reason: "done", exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("decodes error payloads and propagates the message with a non-zero exit code", () => {
     assert.deepEqual(
       interpretExitSidecar({
@@ -2631,6 +2661,35 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /todo\(\{ action: "update"/);
     assert.match(presentation, /status: "completed"/);
+  });
+
+  it("includes the subagent's own todo state in the result", () => {
+    // The child kept its own task list; the parent had no visibility into it.
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 0,
+        elapsed: 30,
+        summary: "Done",
+        sessionFile: "/tmp/subagent.jsonl",
+        todos: "[x] fix layout\n[ ] rerun visual check",
+      },
+      "worker",
+    );
+
+    assert.match(presentation, /Sub-agent todo state:/);
+    assert.match(presentation, /\[ \] rerun visual check/);
+  });
+
+  it("findLastTodoState returns the last rendered todo list", () => {
+    const entries: any[] = [
+      { type: "message", message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "noise" }] } },
+      { type: "message", message: { role: "toolResult", toolName: "todo", content: [{ type: "text", text: "[ ] first" }] } },
+      { type: "message", message: { role: "toolResult", toolName: "todo", content: [{ type: "text", text: "[x] second" }] } },
+    ];
+
+    assert.equal(findLastTodoState(entries), "[x] second");
+    assert.equal(findLastTodoState([]), null);
   });
 
   it("failure text does not tell the orchestrator to close the todo item", () => {

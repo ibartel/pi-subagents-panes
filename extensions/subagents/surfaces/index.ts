@@ -238,7 +238,7 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
+  reason: "done" | "sentinel" | "error" | "pane-gone";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
@@ -265,7 +265,30 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+export const __pollForExitTest__ = { interpretExitSidecar, readExitSidecar };
+
+/**
+ * Read a completion sidecar for this session, if one is present.
+ *
+ * `.done` is written by subagent-done.ts on a clean auto-exit, `.exit` on a
+ * provider error. Both are removed once consumed so a resumed session does not
+ * immediately look finished again.
+ */
+function readExitSidecar(sessionFile: string | undefined): PollResult | null {
+  if (!sessionFile) return null;
+  for (const suffix of [".done", ".exit"] as const) {
+    const file = `${sessionFile}${suffix}`;
+    try {
+      if (!existsSync(file)) continue;
+      const data = JSON.parse(readFileSync(file, "utf-8"));
+      rmSync(file, { force: true });
+      return interpretExitSidecar(data);
+    } catch {
+      // Unreadable or vanished between the check and the read: try the next one.
+    }
+  }
+  return null;
+}
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
@@ -283,23 +306,19 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  // A destroyed pane (tab closed, process reaped, mux restarted) makes every
+  // screen read throw. Without this counter that case produced an infinite
+  // poll: the parent never woke up even though Orca showed the pane as done.
+  let screenReadFailures = 0;
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
+    // Fast path: completion sidecar written by the child on its way out.
+    const sidecar = readExitSidecar(options.sessionFile);
+    if (sidecar) return sidecar;
 
     // Check Claude sentinel file (written by plugin Stop hook)
     if (options.sentinelFile) {
@@ -313,21 +332,20 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
+      screenReadFailures = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+      // Surface may have been destroyed — a sidecar may still have landed.
+      const late = readExitSidecar(options.sessionFile);
+      if (late) return late;
+      screenReadFailures++;
+      if (screenReadFailures >= 3 && options.sessionFile && existsSync(options.sessionFile)) {
+        // The transcript exists and the pane is unreadable: the child is gone,
+        // so report completion and let the caller take the last message.
+        return { reason: "pane-gone", exitCode: 0 };
       }
     }
 

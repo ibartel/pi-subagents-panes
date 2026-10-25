@@ -12,6 +12,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -31,6 +32,7 @@ import {
 import {
   countSessionEntryLines,
   findLastAssistantMessage,
+  findLastTodoState,
   getNewEntries,
   getSessionId,
   readNameRegistry,
@@ -1014,7 +1016,7 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "todos"
   >,
   name: string,
 ): string {
@@ -1039,15 +1041,19 @@ function resolveResultPresentation(
     );
   }
 
+  // The child's own task list never reached the orchestrator: it reported a
+  // summary and the parent had no idea which child items were left open.
+  const todoBlock = result.todos ? `\n\nSub-agent todo state:\n${result.todos}` : "";
+
   if (result.exitCode !== 0) {
-    return `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`;
+    return `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${todoBlock}${sessionRef}`;
   }
 
   // A subagent does the work; the parent owns the todo list. Without this line
   // the orchestrator reported the child's result and moved on, leaving finished
   // items visually open. Successful runs only — a failed item must stay open.
   return (
-    `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}` +
+    `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${todoBlock}${sessionRef}` +
     `\n\nIf a todo item covers this work, close it now: todo({ action: "update", id: <id>, status: "completed" }). ` +
     `Do not leave a finished item open.`
   );
@@ -1071,6 +1077,8 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+  /** Last rendered todo list the subagent left behind, if it used the todo tool. */
+  todos?: string;
 }
 
 /**
@@ -1122,6 +1130,43 @@ let spawnedThisRun = 0;
 // modules share. (subagent-done.ts reads it; if absent it assumes zero.)
 const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-count");
 (globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size;
+
+// ── Orca status reporting ──
+// Orca's managed pi status extension (~/.pi/agent/extensions/orca-agent-status.ts)
+// builds the dashboard's sub-agent roster and holds the pane in "working" state
+// from these pi events. Without them Orca marks the main session finished as
+// soon as the non-blocking spawn tool returns, while the spawned panes keep
+// running. Event names mirror upstream pi-subagents (SUBAGENT_ASYNC_*_EVENT).
+const SUBAGENT_ASYNC_STARTED_EVENT = "subagent:async-started";
+const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+
+/** Emit a pi event for Orca's status extension without ever throwing. */
+function emitSubagentEvent(name: string, payload: Record<string, unknown>): void {
+  try {
+    const events = (latestPi as any)?.events;
+    if (events && typeof events.emit === "function") events.emit(name, payload);
+  } catch (error) {
+    console.error(`Failed to emit ${name}:`, error);
+  }
+}
+
+/** Tell Orca a subagent pane is now running. */
+function noteSubagentStarted(running: RunningSubagent): void {
+  emitSubagentEvent(SUBAGENT_ASYNC_STARTED_EVENT, {
+    id: running.id,
+    agent: running.agent ?? running.name,
+    description: `${running.name}: ${running.task}`,
+    startedAt: running.startTime,
+  });
+}
+
+/** Tell Orca a subagent pane settled: completed | failed | aborted. */
+function noteSubagentSettled(running: RunningSubagent, status: "completed" | "failed" | "aborted"): void {
+  emitSubagentEvent(SUBAGENT_ASYNC_COMPLETE_EVENT, {
+    id: running.id,
+    status,
+  });
+}
 
 // ── Widget management ──
 
@@ -1403,6 +1448,23 @@ function resolveSubagentToolAllowlist(
  * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
  * responsibility since they differ slightly between launch and resume.
  */
+/**
+ * Path to Orca's managed pi status extension, or null when this session does
+ * not run under Orca (or the extension file is absent).
+ *
+ * Why: default-deny spawns push `--no-extensions`, which also strips Orca's
+ * status extension from the subagent pane. The child then never reports hook
+ * events, and Orca's sidebar shows its pane stale/idle while it works. Loading
+ * the file explicitly restores per-pane status reporting.
+ */
+function resolveOrcaStatusExtensionPath(): string | null {
+  if (!process.env.ORCA_TERMINAL_HANDLE && !process.env.ORCA_PANE_KEY) return null;
+  const agentDir = process.env.ORCA_PI_SOURCE_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR;
+  if (!agentDir) return null;
+  const path = join(agentDir, "extensions", "orca-agent-status.ts");
+  return existsSync(path) ? path : null;
+}
+
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
@@ -1434,6 +1496,12 @@ function applySandboxToParts(
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
+
+    // Keep Orca's sidebar aware of this pane even under default-deny.
+    const orcaStatusExtension = resolveOrcaStatusExtensionPath();
+    if (orcaStatusExtension) {
+      parts.push("-e", shellEscape(orcaStatusExtension));
+    }
 
     // Refresh from pi's registry so a tool shipped by an installed package
     // resolves to the file that actually registers it. This is the single
@@ -1952,6 +2020,7 @@ async function launchSubagent(
     };
 
     runningSubagents.set(id, running);
+    noteSubagentStarted(running);
     return running;
   }
 
@@ -2099,6 +2168,7 @@ async function launchSubagent(
   };
 
   runningSubagents.set(id, running);
+  noteSubagentStarted(running);
   return running;
 }
 
@@ -2170,6 +2240,22 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/**
+ * Remove stale completion/question sidecars before (re)launching a session.
+ *
+ * Resume reuses the same session file, so a `.done` left by the previous run
+ * made the fresh run look finished on the very first poll.
+ */
+function clearSessionSidecars(sessionFile: string): void {
+  for (const suffix of [".done", ".exit", ".ask"]) {
+    try {
+      rmSync(`${sessionFile}${suffix}`, { force: true });
+    } catch {
+      // Nothing to clean up.
+    }
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -2221,14 +2307,17 @@ async function watchSubagent(
 
       closeSurface(surface);
       runningSubagents.delete(running.id);
+      noteSubagentSettled(running, result.exitCode === 0 ? "completed" : "failed");
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
     // Pi subagent result extraction
     let summary: string;
+    let todos: string | null = null;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
+      todos = findLastTodoState(allEntries);
       summary =
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
@@ -2249,6 +2338,7 @@ async function watchSubagent(
 
     closeSurface(surface);
     runningSubagents.delete(running.id);
+    noteSubagentSettled(running, result.exitCode === 0 ? "completed" : "failed");
 
     return {
       name,
@@ -2260,6 +2350,7 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
+      ...(todos ? { todos } : {}),
     };
   } catch (err: any) {
     try {
@@ -2269,6 +2360,7 @@ async function watchSubagent(
       // handle after a restart). Nothing is left to clean up.
     }
     runningSubagents.delete(running.id);
+    noteSubagentSettled(running, signal.aborted ? "aborted" : "failed");
 
     if (signal.aborted) {
       return {
@@ -2344,6 +2436,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
+        "AGENT BUDGET: one agent is the default. Spawn a second only when two investigations are genuinely independent; never chain scout->worker->reviewer for one change. For a single-file edit, a CSS/layout/spacing/color tweak, a copy change, or a question one read answers, do not spawn anything: do it yourself. A reviewer is for complex or risky diffs only, never for layout fixes. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
@@ -2351,6 +2444,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
+        "AGENT BUDGET: one agent is the default. Spawn a second only when two investigations are genuinely independent; never chain scout->worker->reviewer for one change. For a single-file edit, a CSS/layout/spacing/color tweak, a copy change, or a question one read answers, do not spawn anything: do it yourself. A reviewer is for complex or risky diffs only, never for layout fixes. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       parameters: SubagentParams,
 
@@ -2855,6 +2949,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Count lines cheaply (no per-line JSON.parse) so resuming a large
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
+        clearSessionSidecars(sessionPath);
 
         const surface = createSurface(
           name,
@@ -2959,6 +3054,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+        noteSubagentStarted(running);
         startWidgetRefresh();
         startStatusRefresh(pi);
 

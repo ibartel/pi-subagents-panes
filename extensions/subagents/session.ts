@@ -503,6 +503,36 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
 }
 
 /**
+ * Last rendered `todo` tool result in a subagent transcript.
+ *
+ * Subagents keep their own task list, which the parent never saw: the child
+ * finished with items open and the orchestrator had no idea. Returning the last
+ * rendered list lets the result message carry that state back.
+ */
+export function findLastTodoState(entries: SessionEntry[], maxChars = 1200): string | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+    const msg = entry as MessageEntry & { message: { toolName?: unknown } };
+    if (msg.message.role !== "toolResult") continue;
+    if (msg.message.toolName !== "todo") continue;
+
+    const text = msg.message.content
+      .filter(
+        (block) =>
+          block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
+      )
+      .map((block) => block.text as string)
+      .join("\n")
+      .trim();
+    if (!text) continue;
+    // Keep the tail: the summary/legend sits at the end of the rendered list.
+    return text.length > maxChars ? `…${text.slice(-maxChars)}` : text;
+  }
+  return null;
+}
+
+/**
  * Append a branch_summary entry to the session file.
  * Returns the new entry's id.
  */
