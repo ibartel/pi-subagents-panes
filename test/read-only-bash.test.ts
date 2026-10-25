@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkReadOnlyCommand } from "../pi-extension/subagents/tools/read-only-bash.ts";
+import { checkReadOnlyCommand } from "../extensions/subagents/tools/read-only-bash.ts";
 
 function allowed(command: string): void {
   assert.equal(checkReadOnlyCommand(command), null, `expected allowed: ${command}`);

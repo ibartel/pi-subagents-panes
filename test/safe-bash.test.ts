@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isDangerous } from "../pi-extension/subagents/tools/safe-bash.ts";
+import { isDangerous } from "../extensions/subagents/tools/safe-bash.ts";
 
 function blocked(command: string): void {
 	const reason = isDangerous(command);

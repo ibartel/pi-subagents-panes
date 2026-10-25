@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents-panes",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "description": "Async subagents for pi, displayed as tabs or splits in Orca, herdr, or tmux",
   "keywords": [
     "pi-package",
@@ -20,7 +20,7 @@
   "type": "module",
   "files": [
     "agents/",
-    "pi-extension/",
+    "extensions/",
     "config.json.example",
     "README.md",
     "NOTICE.md",
@@ -38,7 +38,7 @@
   },
   "pi": {
     "extensions": [
-      "./pi-extension/subagents/index.ts"
+      "./extensions/subagents/index.ts"
     ]
   },
   "devDependencies": {

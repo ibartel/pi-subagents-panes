@@ -41,7 +41,7 @@ orchestrator's pane. New surfaces are created without stealing focus.
 
 For tmux, panes stay evenly sized: the extension re-applies an `even-horizontal` layout after every
 spawn and exit (debounced). Change `SUBAGENT_TMUX_LAYOUT` in
-`pi-extension/subagents/surfaces/tmux.ts` to any named tmux layout (`main-vertical`, `tiled`, …).
+`extensions/subagents/surfaces/tmux.ts` to any named tmux layout (`main-vertical`, `tiled`, …).
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the
 delay:

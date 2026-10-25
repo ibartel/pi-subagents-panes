@@ -8,8 +8,8 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
-import { parseArchitectConfig } from "../pi-extension/subagents/status.ts";
+import * as subagentsModule from "../extensions/subagents/index.ts";
+import { parseArchitectConfig } from "../extensions/subagents/status.ts";
 
 const testApi = (subagentsModule as any).__test__;
 

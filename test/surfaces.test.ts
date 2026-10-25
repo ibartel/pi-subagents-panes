@@ -7,23 +7,23 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { decodeHandle, encodeHandle } from "../pi-extension/subagents/surfaces/types.ts";
+import { decodeHandle, encodeHandle } from "../extensions/subagents/surfaces/types.ts";
 import {
   extractHerdrPaneId,
   extractHerdrScreen,
-} from "../pi-extension/subagents/surfaces/herdr.ts";
+} from "../extensions/subagents/surfaces/herdr.ts";
 import {
   extractOrcaHandle,
   extractOrcaScreen,
-} from "../pi-extension/subagents/surfaces/orca.ts";
+} from "../extensions/subagents/surfaces/orca.ts";
 import {
   parseArchitectConfig,
   parseDefaultsConfig,
   parseDisplayConfig,
   parseModelsConfig,
-} from "../pi-extension/subagents/status.ts";
-import { DEFAULT_DISPLAY_CONFIG } from "../pi-extension/subagents/status.ts";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+} from "../extensions/subagents/status.ts";
+import { DEFAULT_DISPLAY_CONFIG } from "../extensions/subagents/status.ts";
+import * as subagentsModule from "../extensions/subagents/index.ts";
 
 const testApi = (subagentsModule as any).__test__;
 

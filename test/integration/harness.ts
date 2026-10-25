@@ -29,9 +29,9 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/surfaces/index.ts";
-import { createSurfaceSplitLegacy, isTmuxAvailable, tmuxAdapter } from "../../pi-extension/subagents/surfaces/tmux.ts";
-import { decodeHandle, encodeHandle } from "../../pi-extension/subagents/surfaces/types.ts";
+} from "../../extensions/subagents/surfaces/index.ts";
+import { createSurfaceSplitLegacy, isTmuxAvailable, tmuxAdapter } from "../../extensions/subagents/surfaces/tmux.ts";
+import { decodeHandle, encodeHandle } from "../../extensions/subagents/surfaces/types.ts";
 
 // Re-export the mux-agnostic primitives for tests. The integration harness is
 // tmux-only on purpose: its focus assertions read tmux pane state directly.
@@ -80,7 +80,7 @@ const TEST_AGENTS_SRC = join(HARNESS_DIR, "agents");
  * edits are always the code under test, regardless of what pi-packages are
  * installed on the host.
  */
-const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.ts");
+const EXTENSION_SOURCE = join(PROJECT_ROOT, "extensions", "subagents", "index.ts");
 
 // ── Configuration ──
 
@@ -172,16 +172,22 @@ export function cleanupTestEnv(env: TestEnv): void {
   for (const surface of env.surfaces) {
     try {
       closeSurface(surface);
-    } catch {}
+    } catch {
+      // Surface already gone; teardown is best effort.
+    }
   }
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
-    } catch {}
+    } catch {
+      // Temp file already removed; teardown is best effort.
+    }
   }
   try {
     rmSync(env.dir, { recursive: true, force: true });
-  } catch {}
+  } catch {
+    // Temp dir already removed; teardown is best effort.
+  }
 }
 
 /**
@@ -267,14 +273,18 @@ export async function waitForScreen(
     try {
       const screen = await readScreenAsync(surface, lines);
       if (pattern.test(screen)) return screen;
-    } catch {}
+    } catch {
+      // Pane may not have rendered yet; keep polling until the deadline.
+    }
     await sleep(2000);
   }
 
   let finalScreen = "";
   try {
     finalScreen = readScreen(surface, lines);
-  } catch {}
+  } catch {
+    // Surface is gone already; report an empty screen with the error.
+  }
   throw new Error(
     `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,
   );

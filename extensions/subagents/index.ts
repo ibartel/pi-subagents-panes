@@ -67,7 +67,7 @@ import {
   type SubagentActivityState,
 } from "./activity.ts";
 
-/** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
+/** Absolute path to `extensions/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
@@ -294,7 +294,7 @@ export function refreshToolSourcePaths(pi?: ExtensionAPI | null): void {
 }
 
 /**
- * Map a custom (non-built-in) tool name to the pi-extension file that
+ * Map a custom (non-built-in) tool name to the extension file that
  * registers it. Used to build the child's `--extension` whitelist after
  * `--no-extensions` disables global discovery. Returns undefined for built-in
  * tools and for unknown names (which simply won't be granted).

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import * as subagentsModule from "../extensions/subagents/index.ts";
 
 const testApi = (subagentsModule as any).__test__;
 
@@ -30,14 +30,14 @@ import {
   mergeNewEntries,
   seedSubagentSessionFile,
   summarizeSessionStats,
-} from "../pi-extension/subagents/session.ts";
+} from "../extensions/subagents/session.ts";
 
 import {
   shellEscape,
   renderScript,
   renderScriptHeader,
   writeScriptFile,
-} from "../pi-extension/subagents/surfaces/index.ts";
+} from "../extensions/subagents/surfaces/index.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -50,20 +50,20 @@ import {
   observeStatus,
   loadStatusConfig,
   parseStatusConfig,
-} from "../pi-extension/subagents/status.ts";
+} from "../extensions/subagents/status.ts";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
-} from "../pi-extension/subagents/activity.ts";
+} from "../extensions/subagents/activity.ts";
 import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   runningChildrenCount,
-} from "../pi-extension/subagents/subagent-done.ts";
-import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/surfaces/index.ts";
+} from "../extensions/subagents/subagent-done.ts";
+import subagentDoneExtension from "../extensions/subagents/subagent-done.ts";
+import { __pollForExitTest__ } from "../extensions/subagents/surfaces/index.ts";
 
 // --- Helpers ---
 
