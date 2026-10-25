@@ -30,12 +30,17 @@ guess.
 
 | Level | Signals | Fleet |
 | --- | --- | --- |
-| **trivial** | one file, known lines, mechanical | 1 `worker`, allround model, low thinking |
-| **standard** | 2–5 files, area known | 1 `scout` → 1 `worker`, allround model |
+| **trivial** | one file, known lines, mechanical — CSS/layout/spacing/color tweaks, copy edits, renames, log lines | 1 `worker`, allround model, low thinking. **No reviewer.** |
+| **standard** | 2–5 files, area known | 1 `scout` → 1 `worker`, allround model. **No reviewer.** |
 | **complex** | unknown area, 5+ files, cross-cutting | 2 parallel `scout`s → `worker` → `reviewer` |
 | **risky** | auth, migrations, destructive ops, public API | `scout`s → `worker` → `reviewer` → `tester` |
 
 State the level in the plan. If you cannot tell, it is not trivial.
+
+**Reviewer is an escalation, not a default.** It runs only for `complex` and `risky`. For
+trivial and standard work the worker's own read-then-edit pass is the review: a layout fix does not
+need a second agent to say the CSS looks tidy. Adding a reviewer to a one-file change triples the
+wall-clock time and token spend for no new information.
 
 Fewer agents is better. Each extra agent costs tokens and time, and adds a place where the brief
 can be wrong. Do not add an agent because the level table has room for it. Stop at the smallest
@@ -90,6 +95,9 @@ subagent({ agent: "scout", model: "provider/id:low", task: "…" })
 // after that returns
 subagent({ agent: "worker", model: "provider/id:high", task: "…" })
 ```
+
+When a spawned agent finishes, close its todo item before anything else. The todo list is the
+caller's, not the agent's: mark it completed in the same turn the result arrives.
 
 ## 3. Budget
 

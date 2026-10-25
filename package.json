@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents-panes",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "description": "Async subagents for pi, displayed as tabs or splits in Orca, herdr, or tmux",
   "keywords": [
     "pi-package",

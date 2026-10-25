@@ -1039,9 +1039,18 @@ function resolveResultPresentation(
     );
   }
 
-  return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+  if (result.exitCode !== 0) {
+    return `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`;
+  }
+
+  // A subagent does the work; the parent owns the todo list. Without this line
+  // the orchestrator reported the child's result and moved on, leaving finished
+  // items visually open. Successful runs only — a failed item must stay open.
+  return (
+    `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}` +
+    `\n\nIf a todo item covers this work, close it now: todo({ action: "update", id: <id>, status: "completed" }). ` +
+    `Do not leave a finished item open.`
+  );
 }
 
 /**

@@ -1414,9 +1414,10 @@ describe("subagent discovery", () => {
       // --no-extensions must be paired with an explicit -e for the todo tool,
       // otherwise the child cannot see the tool at all.
       assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
-      const eIdx = parts.indexOf("-e");
-      assert.ok(eIdx >= 0, "expected -e for the package-provided tool");
-      assert.ok(parts[eIdx + 1].includes("rpiv-todo-extension.js"), "expected -e to point at the todo extension file");
+      // Locate by value: default-deny spawns may carry additional -e entries
+      // (e.g. Orca's managed status extension when tests run inside Orca).
+      const todoIdx = parts.findIndex((p, i) => p === "-e" && parts[i + 1]?.includes("rpiv-todo-extension.js"));
+      assert.ok(todoIdx >= 0, "expected -e to point at the todo extension file");
 
       testApi.refreshToolSourcePaths(null);
     });
@@ -2617,6 +2618,29 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_message\(\{ name: "fin"/);
     assert.doesNotMatch(presentation, /message: "…"/, "must not leave an empty-message stub");
     assert.match(presentation, /If a follow-up is ever needed/);
+  });
+
+  it("completion text tells the orchestrator to close the matching todo item", () => {
+    // Subagents finish work; the parent owns the todo list. The wake message
+    // carries the reminder so finished items do not stay visually open.
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      { exitCode: 0, elapsed: 12, summary: "Fixed the grid gap", sessionFile: "/tmp/subagent.jsonl" },
+      "worker",
+    );
+
+    assert.match(presentation, /todo\(\{ action: "update"/);
+    assert.match(presentation, /status: "completed"/);
+  });
+
+  it("failure text does not tell the orchestrator to close the todo item", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      { exitCode: 1, elapsed: 9, summary: "boom", sessionFile: "/tmp/subagent.jsonl" },
+      "worker",
+    );
+
+    assert.doesNotMatch(presentation, /todo\(\{ action: "update"/);
   });
 
   it("formats exit code 130 as an ordinary failure", () => {
