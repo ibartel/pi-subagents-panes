@@ -18,6 +18,14 @@
     }
   ],
   "type": "module",
+  "files": [
+    "agents/",
+    "pi-extension/",
+    "config.json.example",
+    "README.md",
+    "NOTICE.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --test test/test.ts test/surfaces.test.ts test/plan-mode-architect.test.ts test/read-only-bash.test.ts test/safe-bash.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
