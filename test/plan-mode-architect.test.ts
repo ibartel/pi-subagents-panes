@@ -42,7 +42,7 @@ describe("plan-mode architect loadout", () => {
     }
 
     assert.ok(tools.includes("ask_question"), "ask_question must survive the restriction");
-    for (const declared of ["read", "grep", "find", "ls", "bash", "models"]) {
+    for (const declared of ["read", "grep", "find", "ls", "read_only_bash", "models"]) {
       assert.ok(tools.includes(declared), `declared architect tool ${declared} must be present`);
     }
   });

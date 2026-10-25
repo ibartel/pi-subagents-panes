@@ -320,6 +320,7 @@ function getToolExtensionPath(tool: string): string | undefined {
     youtube_search: join(extBase, "youtube-search", "index.ts"),
     google_image_search: join(extBase, "google-image-search", "index.ts"),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
+    read_only_bash: join(SUBAGENTS_DIR, "tools", "read-only-bash.ts"),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
   // when that path no longer exists on disk (e.g. a built-in tool extension
@@ -957,7 +958,14 @@ export function formatArchitectDirective(config: ArchitectConfig): string {
         ? "AUTONOMY: confirm-first. Before spawning anything, call ask_question with your plan and wait for approval. If approved, spawn exactly what the plan says."
         : "AUTONOMY: execute. Spawn the plan immediately without asking, then report what each agent produced.";
 
-  return `## Operating limits (from config)\n${modeText}\nHard limits: ${caps}. Exceeding them fails the spawn.`;
+  const readOnlyText =
+    "READ-ONLY: the repository is not yours to change in any mode. Do not write, edit, format, " +
+    "install, or run commands that modify files (read_only_bash enforces this). Implementation is " +
+    "always a spawned agent's job, never yours — even for a one-line change. Close every answer " +
+    "with the implementation strategy: agent count, each agent, its model id and thinking level, " +
+    "its dependencies, and the spawn calls for them.";
+
+  return `## Operating limits (from config)\n${modeText}\n${readOnlyText}\nHard limits: ${caps}. Exceeding them fails the spawn.`;
 }
 
 /**

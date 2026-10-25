@@ -1224,6 +1224,7 @@ describe("subagent discovery", () => {
       assert.equal(testApi.getToolExtensionPath("bash"), undefined);
       assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
       assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+      assert.ok(testApi.getToolExtensionPath("read_only_bash")?.endsWith("tools/read-only-bash.ts"));
       // Spawning tools are registered by this extension itself.
       assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
       // Unknown/absent tool extensions resolve to nothing rather than a dead path.

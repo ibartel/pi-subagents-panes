@@ -189,7 +189,7 @@ parent propagates to all of them. Set `model:` in the frontmatter (or `defaults.
 | **debugger** | high | `read`, `grep`, `find`, `ls`, `bash`, `edit` | Reproduces a failure, narrows to the cause, proves a minimal fix |
 | **tester** | medium | `read`, `write`, `edit`, `grep`, `find`, `ls`, `bash` | Writes focused tests and runs them to green |
 | **scribe** | medium | `read`, `write`, `grep`, `find`, `ls`, `bash` | Documentation that matches the code |
-| **architect** | high | `read`, `grep`, `find`, `ls`, `bash`, `models` + spawning | Plans agent cascade and model choice, then runs it |
+| **architect** | high | `read`, `grep`, `find`, `ls`, `read_only_bash`, `models` + spawning | Read-only planner: classifies the work, then returns the agent fleet, models and thinking levels |
 
 All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt
 (`system-prompt: append`). `worker` may spawn `scout` and `researcher`; `architect` may spawn any of
@@ -198,12 +198,30 @@ them (see below).
 ## Architect
 
 `subagent({ agent: "architect", task })` asks a planner to decide *how* the work runs: which agents,
-in what order, and which model each one gets. It classifies complexity first, calls `models` for
-live cost/context/thinking facts, and justifies every spawn in one line.
+in what order, which model each one gets, and which thinking level it runs at.
 
 ```typescript
 subagent({ agent: "architect", task: "Add rate limiting to the public API" });
 ```
+
+**It plans; it never implements.** The architect's toolset has no `write`/`edit`, and its shell is
+`read_only_bash`, which rejects redirection, command substitution, chaining, `sed -i`,
+`find -exec/-delete`, and every mutating git subcommand. So it cannot change the repository even in
+`confirm`/`auto` mode — implementation is always a spawned agent's job. If you want the plan without
+a run, set `architect.mode: "plan"`.
+
+**The deliverable is the strategy.** Its final message ends with a table the caller can act on
+without re-deriving anything:
+
+```text
+Agent      Model                     Thinking  Depends on  Task
+scout      deepseek/deepseek-v4.1-flash  low       —           map token validation paths
+worker     deepseek/deepseek-v4.1-flash  xhigh     1           apply the fix in returned files
+reviewer   anthropic/claude-sonnet-5.5   high      2           check diff for regressions
+```
+
+plus copy-paste `subagent({ agent, model, task })` calls, the agent count with its justification,
+and the remaining risks. It classifies complexity first and justifies every spawn in one line.
 
 **Model data comes from pi, not from config.** `models` reads the live registry — cost per Mtok,
 context window, supported thinking levels, credential status. Config only adds what pi cannot know:
@@ -265,7 +283,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Model selector (`provider/id`). Omit to inherit from `defaults.model`, then the parent's current model |
 | `thinking` | string | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omit to inherit from `defaults.thinking`, then the parent's level |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `read_only_bash` (inspection-only shell), `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
